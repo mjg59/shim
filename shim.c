@@ -1952,6 +1952,36 @@ static EFI_STATUS mok_ignore_db()
 }
 
 /*
+ * Check the boot option before handling the string of load options.
+ */
+static int check_boot_option (void *boot_option, UINT32 boot_option_size,
+			      void **load_opts, UINT32 *load_opts_size)
+{
+	/* A minimal boot option: Attributes + FilePathListLength + NULL description */
+	unsigned int size = sizeof(UINT32) + sizeof(UINT16) + sizeof(CHAR16);
+	unsigned int desclen, pathlen;
+
+	if (size > boot_option_size)
+		return 0;
+
+	pathlen = *(UINT16 *)(boot_option + sizeof(UINT32));
+	size += pathlen;
+	if (size > boot_option_size)
+		return 0;
+
+	/* Detect the length of Description */
+	desclen = StrLen(boot_option + sizeof(UINT32) + sizeof(UINT16)) * sizeof(CHAR16);
+	size += desclen;
+	if (size >= boot_option_size)
+		return 0;
+
+	*load_opts = boot_option + size;
+	*load_opts_size = boot_option_size - size;
+
+	return 1;
+}
+
+/*
  * Check the load options to specify the second stage loader
  */
 EFI_STATUS set_second_stage (EFI_HANDLE image_handle)
@@ -1963,6 +1993,8 @@ EFI_STATUS set_second_stage (EFI_HANDLE image_handle)
 	int remaining_size = 0;
 	CHAR16 *loader_str = NULL;
 	unsigned int loader_len = 0;
+	void *load_opts;
+	UINT32 load_opts_size;
 
 	second_stage = DEFAULT_LOADER;
 	load_options = NULL;
@@ -1975,11 +2007,22 @@ EFI_STATUS set_second_stage (EFI_HANDLE image_handle)
 		return status;
 	}
 
+	/*
+	 * Boot manager will pass a boot option to shim if shim is named
+	 * as bootia32.efi/bootx64.efi. It is necessary to carefully check
+	 * the validity of load options if a real boot option is passed.
+	 */
+	if (!check_boot_option(li->LoadOptions, li->LoadOptionsSize,
+			       &load_opts, &load_opts_size)) {
+		load_opts = li->LoadOptions;
+		load_opts_size = li->LoadOptionsSize;
+	}
+
 	/* Expect a CHAR16 string with at least one CHAR16 */
-	if (li->LoadOptionsSize < 4 || li->LoadOptionsSize % 2 != 0) {
+	if (load_opts_size < 4 || load_opts_size % 2 != 0) {
 		return EFI_BAD_BUFFER_SIZE;
 	}
-	c = (CHAR16 *)(li->LoadOptions + (li->LoadOptionsSize - 2));
+	c = (CHAR16 *)(load_opts + (load_opts_size - 2));
 	if (*c != L'\0') {
 		return EFI_BAD_BUFFER_SIZE;
 	}
@@ -1989,12 +2032,12 @@ EFI_STATUS set_second_stage (EFI_HANDLE image_handle)
 	 * We ignore the string before the first L' ', i.e. the name of this
 	 * program.
 	 */
-	for (i = 0; i < li->LoadOptionsSize; i += 2) {
-		c = (CHAR16 *)(li->LoadOptions + i);
+	for (i = 0; i < load_opts_size; i += 2) {
+		c = (CHAR16 *)(load_opts + i);
 		if (*c == L' ') {
 			*c = L'\0';
 			start = c + 1;
-			remaining_size = li->LoadOptionsSize - i - 2;
+			remaining_size = load_opts_size - i - 2;
 			break;
 		}
 	}
