@@ -63,8 +63,12 @@ extern struct {
 
 UINT32 vendor_cert_size;
 UINT32 vendor_dbx_size;
+UINT32 addon_cert_size;
+UINT32 addon_dbx_size;
 UINT8 *vendor_cert;
 UINT8 *vendor_dbx;
+UINT8 *addon_cert;
+UINT8 *addon_dbx;
 #if defined(ENABLE_SHIM_CERT)
 UINT32 build_cert_size;
 UINT8 *build_cert;
@@ -473,15 +477,10 @@ static CHECK_STATUS check_db_hash(CHAR16 *dbname, EFI_GUID guid, UINT8 *data,
 
 }
 
-/*
- * Check whether the binary signature or hash are present in dbx or the
- * built-in blacklist
- */
-static EFI_STATUS check_blacklist (WIN_CERTIFICATE_EFI_PKCS *cert,
-				   UINT8 *sha256hash, UINT8 *sha1hash)
+static EFI_STATUS check_dbx (WIN_CERTIFICATE_EFI_PKCS *cert,
+			     UINT8 *sha256hash, UINT8 *sha1hash,
+			     EFI_SIGNATURE_LIST *dbx)
 {
-	EFI_SIGNATURE_LIST *dbx = (EFI_SIGNATURE_LIST *)vendor_dbx;
-
 	if (check_db_hash_in_ram(dbx, vendor_dbx_size, sha256hash,
 			SHA256_DIGEST_SIZE, EFI_CERT_SHA256_GUID, L"dbx",
 			EFI_SECURE_BOOT_DB_GUID) == DATA_FOUND) {
@@ -500,6 +499,23 @@ static EFI_STATUS check_blacklist (WIN_CERTIFICATE_EFI_PKCS *cert,
 		LogError(L"cert sha256hash found in vendor dbx\n");
 		return EFI_SECURITY_VIOLATION;
 	}
+
+	return EFI_SUCCESS;
+}
+
+/*
+ * Check whether the binary signature or hash are present in dbx or the
+ * built-in blacklist
+ */
+static EFI_STATUS check_blacklist (WIN_CERTIFICATE_EFI_PKCS *cert,
+				   UINT8 *sha256hash, UINT8 *sha1hash)
+{
+	if (EFI_ERROR(check_dbx(cert, sha256hash, sha1hash,
+				(EFI_SIGNATURE_LIST *)vendor_dbx)))
+		return EFI_SECURITY_VIOLATION;
+	if (addon_cert_size && EFI_ERROR(check_dbx(cert, sha256hash, sha1hash,
+					     (EFI_SIGNATURE_LIST *)addon_dbx)))
+		return EFI_SECURITY_VIOLATION;
 	if (check_db_hash(L"dbx", EFI_SECURE_BOOT_DB_GUID, sha256hash,
 			  SHA256_DIGEST_SIZE, EFI_CERT_SHA256_GUID) == DATA_FOUND) {
 		LogError(L"binary sha256hash found in system dbx\n");
@@ -1003,6 +1019,25 @@ static EFI_STATUS verify_buffer (char *data, int datasize,
 		}
 #endif /* defined(ENABLE_SHIM_CERT) */
 
+		clear_ca_warning();
+		if (addon_cert_size &&
+		    AuthenticodeVerify(cert->CertData,
+				       cert->Hdr.dwLength - sizeof(cert->Hdr),
+				       addon_cert, addon_cert_size,
+				       sha256hash, SHA256_DIGEST_SIZE)) {
+			if (get_ca_warning()) {
+				show_ca_warning();
+			}
+			update_verification_method(VERIFIED_BY_CERT);
+			tpm_measure_variable(L"Shim", SHIM_LOCK_GUID,
+					     addon_cert_size, addon_cert);
+			efi_status = EFI_SUCCESS;
+			drain_openssl_errors();
+			return efi_status;
+		} else {
+			LogError(L"AuthenticodeVerify(vendor_cert) failed\n");
+		}
+			
 		/*
 		 * And finally, check against shim's built-in key
 		 */
@@ -2409,6 +2444,51 @@ uninstall_shim_protocols(void)
 #endif
 }
 
+/* Read additional certificates from a file (after verifying its signature) */
+EFI_STATUS
+load_certs(EFI_HANDLE image_handle)
+{
+	EFI_STATUS efi_status;
+	EFI_LOADED_IMAGE *li = NULL;
+	CHAR16 *PathName = NULL;
+	void *data = NULL;
+	int datasize;
+	void *pointer;
+	int i;
+	PE_COFF_LOADER_IMAGE_CONTEXT context;
+	EFI_IMAGE_SECTION_HEADER *Section;
+
+	efi_status = read_image(image_handle, L"shim_certs.efi", li, PathName,
+				&data, &datasize);
+
+	if (EFI_ERROR(efi_status))
+		return efi_status;
+
+	efi_status = verify_image(data, datasize, li, &context);
+
+	if (EFI_ERROR(efi_status))
+		return efi_status;
+
+	Section = context.FirstSection;
+	for (i = 0; i < context.NumberOfSections; i++, Section++) {
+		if (CompareMem(Section->Name, ".shimdb\0\0", 9) == 0) {
+			addon_cert_size = Section->SizeOfRawData;
+			addon_cert = AllocatePool(addon_cert_size);
+			pointer = ImageAddress(data, datasize,
+					       Section->PointerToRawData);
+			memcpy(addon_cert, pointer, addon_cert_size);
+		} else if (CompareMem(Section->Name, ".shimdbx\0\0", 10) == 0) {
+			addon_dbx_size = Section->SizeOfRawData;
+			addon_dbx = AllocatePool(addon_dbx_size);
+			pointer = ImageAddress(data, datasize,
+					       Section->PointerToRawData);
+			memcpy(addon_dbx, pointer, addon_dbx_size);
+		}
+	}
+	FreePool(data);
+	return EFI_SUCCESS;
+}
+
 EFI_STATUS
 shim_init(void)
 {
@@ -2425,6 +2505,7 @@ shim_init(void)
 	}
 
 	if (secure_mode()) {
+		efi_status = load_certs(global_image_handle);
 		if (vendor_cert_size || vendor_dbx_size) {
 			/*
 			 * If shim includes its own certificates then ensure
