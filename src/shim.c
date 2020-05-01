@@ -363,7 +363,7 @@ static CHECK_STATUS check_db_cert_in_ram(EFI_SIGNATURE_LIST *CertList,
 						if (get_ca_warning()) {
 							show_ca_warning();
 						}
-						tpm_measure_variable(dbname, guid, CertSize, Cert->SignatureData);
+						tpm_measure_variable(dbname, guid, CertList->SignatureSize, Cert);
 						drain_openssl_errors();
 						return DATA_FOUND;
 					} else {
@@ -426,7 +426,7 @@ static CHECK_STATUS check_db_hash_in_ram(EFI_SIGNATURE_LIST *CertList,
 					// Find the signature in database.
 					//
 					IsFound = TRUE;
-					tpm_measure_variable(dbname, guid, SignatureSize, data);
+					tpm_measure_variable(dbname, guid, CertList->SignatureSize, Cert);
 					break;
 				}
 
@@ -989,12 +989,23 @@ static EFI_STATUS verify_buffer (char *data, int datasize,
 			       cert->Hdr.dwLength - sizeof(cert->Hdr),
 			       shim_cert, sizeof(shim_cert), sha256hash,
 			       SHA256_DIGEST_SIZE)) {
+			EFI_SIGNATURE_DATA *shim_sigdata;
+			UINTN sigdata_size = sizeof(*shim_sigdata) -
+				sizeof(shim_sigdata->SignatureData) +
+				sizeof(shim_cert);
+
+			shim_sigdata = AllocatePool(sigdata_size);
+			memcpy(&shim_sigdata->SignatureOwner, &SHIM_LOCK_GUID,
+			       sizeof(shim_sigdata->SignatureOwner));
+			memcpy(shim_sigdata->SignatureData, shim_cert,
+			       sizeof(shim_cert));
 			if (get_ca_warning()) {
 				show_ca_warning();
 			}
 			update_verification_method(VERIFIED_BY_CERT);
 			tpm_measure_variable(L"Shim", SHIM_LOCK_GUID,
-					     sizeof(shim_cert), shim_cert);
+					     sigdata_size, shim_sigdata);
+			FreePool(shim_sigdata);
 			efi_status = EFI_SUCCESS;
 			drain_openssl_errors();
 			return efi_status;
@@ -1012,12 +1023,23 @@ static EFI_STATUS verify_buffer (char *data, int datasize,
 				       cert->Hdr.dwLength - sizeof(cert->Hdr),
 				       vendor_cert, vendor_cert_size,
 				       sha256hash, SHA256_DIGEST_SIZE)) {
+			EFI_SIGNATURE_DATA *shim_sigdata;
+			UINTN sigdata_size = sizeof(*shim_sigdata) -
+				sizeof(shim_sigdata->SignatureData) +
+				vendor_cert_size;
+
+			shim_sigdata = AllocatePool(sigdata_size);
+			memcpy(&shim_sigdata->SignatureOwner, &SHIM_LOCK_GUID,
+			       sizeof(shim_sigdata->SignatureOwner));
+			memcpy(shim_sigdata->SignatureData, vendor_cert,
+			       vendor_cert_size);
 			if (get_ca_warning()) {
 				show_ca_warning();
 			}
 			update_verification_method(VERIFIED_BY_CERT);
 			tpm_measure_variable(L"Shim", SHIM_LOCK_GUID,
-					     vendor_cert_size, vendor_cert);
+					     sigdata_size, shim_sigdata);
+			FreePool(shim_sigdata);
 			efi_status = EFI_SUCCESS;
 			drain_openssl_errors();
 			return efi_status;
